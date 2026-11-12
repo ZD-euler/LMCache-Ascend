@@ -4,8 +4,10 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from itertools import pairwise
-from threading import Condition, Thread, get_ident
-from typing import Any, Generator, Iterable, List, Optional, Sequence, Set, Union
+from threading import Condition, Thread, current_thread, get_ident
+from typing import (
+    Any, Callable, Generator, Iterable, List, Optional, Sequence, Set, Union,
+)
 import hashlib
 import json
 import os
@@ -1974,6 +1976,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         use_gpu: bool = False,
         **kwargs,
     ):
+        if kwargs.pop("enable_selected_prefill_writer", False):
+            # The adapter must construct and drive this connector on its
+            # worker thread, including load/store generators and teardown.
+            self._selected_prefill_writer_thread = current_thread()
+            self._selected_prefill_submitted_saves: dict[int, set[str]] = {}
+            self._selected_prefill_closed_saves: set[int] = set()
         self.indexer_c8_layout = kwargs.pop("indexer_c8_layout", None)
         self.indexer_hbm_block_map = kwargs.pop("indexer_hbm_block_map", None)
         mapping = self.indexer_hbm_block_map
@@ -2153,6 +2161,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         old bank's FIFO alone cannot protect their outstanding reads. Waiting
         here retains CPU pages and DMA bindings for a preempted request.
         """
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         pending_store_events_by_request = getattr(
             self, "_layerwise_prefill_async_store_events", {}
         )
@@ -2175,6 +2185,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
     def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
         """Discard one finished request's historical H2D address bindings."""
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         unfenced = getattr(self, "_layerwise_prefill_unfenced_loads", None)
         failed_streams = unfenced.get(req_id) if unfenced else None
         if failed_streams:
@@ -2343,6 +2355,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: int,
         generation: int,
     ) -> None:
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         current = self._layerwise_prefill_transfer_generation(kv_group)
         if generation != current:
             raise RuntimeError(
@@ -2364,10 +2378,29 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         buffers are reused.  A normal step boundary may pass ``False`` only
         after the regular load/store drains have completed.
         """
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
+        selected_writes = getattr(self, "_selected_prefill_writes", {})
+        selected_keys = [
+            key for key in selected_writes if kv_group is None or key[0] == kv_group
+        ]
+        if not synchronize and any(
+            not selected_writes[key][3] for key in selected_keys
+        ):
+            raise RuntimeError(
+                "Cannot reset unconsumed selected prefill writes without synchronization"
+            )
         if synchronize:
             self.load_stream.synchronize()
             self.store_stream.synchronize()
             self._synchronize_layerwise_prefill_dma_streams(kv_group)
+        for key in selected_keys:
+            del selected_writes[key]
+        if kv_group in (None, 0) and getattr(
+            self, "_selected_prefill_writer_thread", None
+        ) is not None:
+            self._selected_prefill_submitted_saves.clear()
+            self._selected_prefill_closed_saves.clear()
         # An aborted/restarted transfer can reuse the request ID with new
         # pages or block mappings. Never carry bound addresses across reset.
         getattr(self, "_prefill_dma_bound_loads", {}).clear()
@@ -2402,6 +2435,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         kv_group: int,
         bank_count: int,
     ) -> None:
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         if bank_count <= 0:
             raise ValueError("layerwise_prefill_bank_count must be positive")
         bank_counts, _, save_done, load_done = (
@@ -2411,6 +2446,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if previous is not None and previous != bank_count:
             if any(group == kv_group for group, *_ in save_done) or any(
                 key[0] == kv_group for key in load_done
+            ) or any(
+                key[0] == kv_group
+                for key in getattr(self, "_selected_prefill_writes", {})
+            ) or (
+                kv_group == 0
+                and getattr(self, "_selected_prefill_closed_saves", set())
             ):
                 raise RuntimeError(
                     "Cannot change layerwise-prefill bank count while transfer "
@@ -2465,8 +2506,20 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         bank FIFO then orders event -> save (if any) -> load, without taking
         another compute-stream snapshot at the later transfer callback.
         """
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         if event is None:
             raise ValueError("Layerwise prefill bank use requires a device event")
+        write = getattr(self, "_selected_prefill_writes", {}).get(
+            (kv_group, layer_id)
+        )
+        if write is not None:
+            if not write[3]:
+                raise RuntimeError(
+                    "Final bank access precedes selected prefill readiness"
+                )
+            if event.device != self.kv_device:
+                raise ValueError("Final bank access event must match the KV device")
         generation = self._layerwise_prefill_transfer_generation(kv_group)
         uses = getattr(self, "_layerwise_prefill_bank_use_events", None)
         if uses is None:
@@ -3224,6 +3277,149 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if not event.query():
                 event.synchronize()
 
+    def _check_selected_prefill_thread(self) -> None:
+        if getattr(self, "_selected_prefill_writer_thread", None) is not current_thread():
+            raise RuntimeError("Selected prefill requires its connector worker thread")
+
+    def close_selected_prefill_bank_save(
+        self,
+        layer_id: int,
+        generation: int,
+        expected_requests: tuple[str, ...],
+    ) -> None:
+        """Close this layer's main-bank save window for the current rank.
+
+        The adapter supplies the complete rank-local save plan, after advancing
+        all its native save generators. An empty plan declares that this rank
+        has no D2H work for the layer. A closed layer rejects further saves.
+        """
+        self._check_selected_prefill_thread()
+        self._check_layerwise_prefill_transfer_generation(0, generation)
+        if not 0 <= layer_id < self._expected_group_layers(0):
+            raise ValueError("Invalid selected prefill save layer")
+        bank = self._layerwise_prefill_bank(layer_id, 0)
+        self._require_layerwise_prefill_bank_use(layer_id, 0, bank)
+        submitted = self._selected_prefill_submitted_saves.get(layer_id, set())
+        if submitted != set(expected_requests):
+            raise RuntimeError(
+                "Selected prefill save plan does not match submitted saves"
+            )
+        self._selected_prefill_closed_saves.add(layer_id)
+
+    def _check_selected_prefill_native_save(
+        self, layer_id: int, request_id: Optional[str],
+    ) -> None:
+        self._check_selected_prefill_thread()
+        if not request_id:
+            raise ValueError("Selected prefill requires a request ID for main saves")
+        if layer_id in self._selected_prefill_closed_saves:
+            raise RuntimeError("Cannot submit a save after the bank save window closed")
+        if request_id in self._selected_prefill_submitted_saves.get(layer_id, ()):
+            raise RuntimeError("Duplicate selected prefill main save")
+
+    def submit_selected_prefill_write(
+        self,
+        layer_id: int,
+        generation: int,
+        sources: dict[str, tuple[MemoryObj, ...]],
+        prerequisites: tuple[Any, ...],
+        enqueue: Callable[[], None],
+    ) -> Any:
+        """Enqueue one selected-main write on the existing physical-bank FIFO.
+
+        The adapter must close the prior layer's save window before reusing
+        its bank. It must provide live references for all host allocations read by the callback
+        until this method takes its own allocator references. Device pointer
+        tables and TopK are supplied by the caller and must remain live until
+        the returned fence completes, or until synchronized cleanup if
+        submission fails. Each prerequisite is an already recorded event for
+        that device, e.g. publication of these operands.
+
+        The callback must enqueue on the active stream synchronously and must
+        not call back into the connector. The caller must join this write via
+        wait_for_layerwise_prefill_load before attention reads the bank.
+        """
+        if not sources:
+            return None
+        self._check_selected_prefill_thread()
+        if not self._layerwise_prefill_dma:
+            raise RuntimeError("Selected prefill writes require P-node bank DMA")
+        kv_group = 0
+        if not 0 <= layer_id < self._expected_group_layers(kv_group):
+            raise ValueError("Invalid selected prefill layer")
+        self._check_layerwise_prefill_transfer_generation(kv_group, generation)
+        counts, _, _, _ = self._layerwise_prefill_transfer_state()
+        bank_count = counts[kv_group]
+        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        if layer_id >= bank_count:
+            previous_layer = layer_id - bank_count
+            self._require_layerwise_prefill_bank_use(previous_layer, kv_group, bank)
+            if previous_layer not in self._selected_prefill_closed_saves:
+                raise RuntimeError("Prior bank save window is still open")
+        use = getattr(self, "_layerwise_prefill_bank_use_events", {}).get(
+            (kv_group, bank)
+        )
+        if use is not None and use[0] == generation and use[1] >= layer_id:
+            raise RuntimeError("Selected prefill write follows final bank access")
+
+        writes = getattr(self, "_selected_prefill_writes", None)
+        if writes is None:
+            writes = self._selected_prefill_writes = {}
+        key = (kv_group, layer_id)
+        if key in writes:
+            raise RuntimeError("Selected prefill write already submitted for layer")
+        if any(not req_id or not owners for req_id, owners in sources.items()):
+            raise ValueError("Selected prefill requests require live source owners")
+
+        stream = self._layerwise_prefill_dma_stream(kv_group, bank)
+        if (
+            self.kv_device is None
+            or self.kv_device.type != "npu"
+            or stream.device != self.kv_device
+            or any(event.device != self.kv_device for event in prerequisites)
+        ):
+            raise ValueError("Selected prefill streams and events must match the KV device")
+        if not prerequisites:
+            raise ValueError("Selected prefill requires a recorded producer event")
+
+        # Record actual allocator holds before enqueue. The ordinary request
+        # teardown releases them only after every native and selected reader.
+        for req_id, owners in sources.items():
+            held = self._layerwise_prefill_load_owners.setdefault(req_id, {})
+            for owner in owners:
+                identity = id(owner)
+                if identity in held:
+                    continue
+                if not owner.is_valid():
+                    raise RuntimeError("Selected prefill source MemoryObj is invalid")
+                owner.ref_count_up()
+                held[identity] = owner
+
+        req_ids = tuple(sources)
+        writes[key] = (generation, req_ids, None, False)
+        try:
+            with torch.npu.stream(stream):
+                for event in prerequisites:
+                    stream.wait_event(event)
+                enqueue()
+                completion = torch.npu.Event()
+                completion.record(stream)
+            self._check_layerwise_prefill_transfer_generation(kv_group, generation)
+            for req_id in req_ids:
+                self._layerwise_prefill_load_request_events.setdefault(
+                    req_id, []
+                ).append(completion)
+            writes[key] = (generation, req_ids, completion, False)
+        except BaseException:
+            # A failed callback may already have queued raw-pointer reads.
+            # Teardown must fence this exact stream before returning owners.
+            for req_id in req_ids:
+                self._retain_unfenced_layerwise_prefill_load(
+                    req_id, kv_group, bank, stream
+                )
+            raise
+        return completion
+
     def wait_for_layerwise_prefill_load(
         self,
         layer_id: int,
@@ -3239,8 +3435,23 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         No host synchronization is introduced.
         """
         _, generations, _, load_done = self._layerwise_prefill_transfer_state()
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         generation = generations.setdefault(int(kv_group), 0)
         current_stream = torch.npu.current_stream()
+        selected_writes = getattr(self, "_selected_prefill_writes", {})
+        selected_key = (kv_group, int(layer_id))
+        selected_write = selected_writes.get(selected_key)
+        if selected_write is not None:
+            selected_generation, selected_requests, selected_ready, _ = selected_write
+            if (
+                selected_generation != generation
+                or selected_ready is None
+                or request_ids is None
+                or set(selected_requests) - set(request_ids)
+                or current_stream.device != self.kv_device
+            ):
+                raise RuntimeError("Invalid selected prefill write for this batch")
         bank = self._layerwise_prefill_bank(layer_id, kv_group)
         bank_streams = getattr(self, "_layerwise_prefill_dma_streams", {})
         bank_fifo_active = (int(kv_group), bank) in bank_streams
@@ -3285,6 +3496,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if previous_tail is not None and previous_tail[0] == generation:
                 waited_event = previous_tail[1]
                 current_stream.wait_event(waited_event)
+        if selected_write is not None:
+            current_stream.wait_event(selected_ready)
+            selected_writes[selected_key] = (
+                selected_generation, selected_requests, selected_ready, True
+            )
+            waited_event = selected_ready
         audit = getattr(self, "prefill_audit", None)
         if audit is not None:
             audit.wait(kv_group, int(layer_id), bank, generation,
@@ -5822,6 +6039,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             fence_debug.wait("d_load", kv_group, layer_id, transfer_stream)
 
     def supports_batched_from_gpu_group(self, kv_group: int = 0) -> bool:
+        if kv_group == 0 and getattr(
+            self, "_selected_prefill_writer_thread", None
+        ) is not None:
+            return False
         return (
             not _DENSE_DIRECT_STORE_DISABLE
             and not _DENSE_DIRECT_GROUP_STORE_DISABLE
@@ -6376,6 +6597,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         **kwargs,
     ) -> tuple[List[List[int]], torch.Tensor]:
         """Store a KV group with one pybind call and one OpCommand."""
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
+            if int(kwargs.get("kv_group", 0) or 0) == 0:
+                raise RuntimeError("Selected prefill requires banked main saves")
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -7539,6 +7764,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         self.initialize_kvcaches_ptr(**kwargs)
         kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
         assert kvcaches_snapshot is not None, (
@@ -9222,6 +9449,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
+        if getattr(self, "_selected_prefill_writer_thread", None) is not None:
+            self._check_selected_prefill_thread()
         self.initialize_kvcaches_ptr(**kwargs)
         kvcaches_snapshot = kwargs.get("kvcaches", self.kvcaches)
         assert kvcaches_snapshot is not None, (
@@ -9289,6 +9518,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             deferred_layerwise_put and dense_direct
             and kwargs.get("prefill_dma_block_ids_by_bank") is not None
         )
+        if (
+            kv_group == 0
+            and getattr(self, "_selected_prefill_writer_thread", None) is not None
+            and not prefill_dma
+        ):
+            raise RuntimeError("Selected prefill requires banked main saves")
         async_layerwise_store = async_layerwise_store and prefill_dma
         if (
             getattr(self, "_layerwise_prefill_dma", False)
@@ -9736,6 +9971,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     self._require_layerwise_prefill_bank_use(
                         layer_id, kv_group, bank,
                     )
+                    if kv_group == 0 and getattr(
+                        self, "_selected_prefill_writer_thread", None
+                    ) is not None:
+                        self._check_selected_prefill_native_save(
+                            layer_id, kwargs.get("req_id")
+                        )
                     with torch.npu.stream(bank_stream):
                         # The final-access event is already ahead of us on
                         # the bank FIFO; do not wait for later compute here.
@@ -9924,6 +10165,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             layerwise_prefill_generation,
                             bank_done_event,
                         )
+                        if prefill_dma and kv_group == 0 and getattr(
+                            self, "_selected_prefill_writer_thread", None
+                        ) is not None:
+                            self._selected_prefill_submitted_saves.setdefault(
+                                layer_id, set()
+                            ).add(kwargs["req_id"])
                         bank_tails = getattr(
                             self, "_layerwise_prefill_bank_tail_events", None
                         )
