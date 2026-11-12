@@ -1,13 +1,95 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Tuple, Union
+from typing import ClassVar, List, Tuple, Union
 
 # Third Party
 from lmcache.logging import init_logger
 import torch
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class PackedMainKVLayout:
+    """Python-only layout for the packed main group.
+
+    Do not send this layout to native APIs that expect KVCacheFormat.
+    Packed rows are opaque bytes in storage, with NOPE, RoPE, and scales
+    inline. There is no separate key, value, or scale plane.
+    """
+
+    SCHEMA: ClassVar[str] = "dsa_packed_main_c8_bf16_rope_fp32_scale_v1"
+    PAGE_TOKENS: ClassVar[int] = 128
+    ROW_BYTES: ClassVar[int] = 512 + 64 * 2 + 4 * 4
+    STORAGE_DTYPE: ClassVar[torch.dtype] = torch.uint8
+
+    layers: int
+    blocks: int
+    device: torch.device
+
+    @classmethod
+    def from_group(
+        cls,
+        kvcaches: List[Tuple[torch.Tensor, ...]],
+        *,
+        kv_group: int,
+        layout: str,
+    ) -> "PackedMainKVLayout":
+        """Recognize packed main only with an explicit main group and schema."""
+        if type(kv_group) is not int or kv_group != 0 or layout != cls.SCHEMA:
+            raise ValueError("Packed main KV requires group 0 and its explicit schema")
+        if not kvcaches:
+            raise ValueError("Packed main KV requires at least one layer")
+        first = cls._packed_tensor(kvcaches[0])
+        result = cls(layers=len(kvcaches), blocks=first.shape[0], device=first.device)
+        for layer in kvcaches[1:]:
+            result._check_layer(layer)
+        return result
+
+    @classmethod
+    def _packed_tensor(cls, layer: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if not isinstance(layer, tuple) or len(layer) != 1:
+            raise ValueError("Packed main KV requires one tensor per layer")
+        (tensor,) = layer
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.dtype != torch.int8
+            or tensor.ndim != 4
+            or tensor.shape[0] <= 0
+            or tensor.shape[1:] != (cls.PAGE_TOKENS, 1, cls.ROW_BYTES)
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("Packed main KV requires contiguous INT8 [blocks, 128, 1, 656]")
+        return tensor
+
+    def _check_layer(self, layer: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        tensor = self._packed_tensor(layer)
+        if tensor.shape[0] != self.blocks or tensor.device != self.device:
+            raise ValueError("Packed main KV layers must agree on capacity and device")
+        return tensor
+
+    def storage_rows(self, layer: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Expose one layer's rows as uint8 with identical bytes and storage."""
+        return self._check_layer(layer).view(self.STORAGE_DTYPE).view(-1, self.ROW_BYTES)
+
+    def chunk_shape(self, num_tokens: int) -> torch.Size:
+        """Return the one-dimensional byte buffer shape for one layer."""
+        if type(num_tokens) is not int or num_tokens < 0:
+            raise ValueError("Packed main KV chunk length must be a nonnegative integer")
+        return torch.Size((num_tokens * self.ROW_BYTES,))
+
+    def payload_schema(self, chunk_size: int) -> dict:
+        """Describe serialized bytes independently of runtime HBM addresses."""
+        return {
+            "format": self.SCHEMA,
+            "layers": self.layers,
+            "chunk_size": chunk_size,
+            "storage_dtype": str(self.STORAGE_DTYPE),
+            "token_bytes": self.ROW_BYTES,
+            "page_bytes": self.layers * self.chunk_shape(chunk_size).numel(),
+        }
 
 
 class KVCacheFormat(Enum):
