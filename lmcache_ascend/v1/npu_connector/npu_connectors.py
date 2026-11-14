@@ -56,7 +56,7 @@ from lmcache_ascend.v1.content_diagnostics import (
     npu_content_diagnostics_enabled,
     register_group0_source_probe,
 )
-from lmcache_ascend.v1.kv_format import KVCacheFormat
+from lmcache_ascend.v1.kv_format import KVCacheFormat, PackedMainKVLayout
 from lmcache_ascend.v1.direct_npu_audit import DirectNpuAudit
 from lmcache_ascend.v1.kv_fence_debug import KVFenceDebug
 from lmcache_ascend.v1.kv_features import (
@@ -73,6 +73,10 @@ from lmcache_ascend.v1.npu_connector.layerwise_dma import (
     bind_incremental_copy_addresses,
     plan_block_id_ranges_incremental,
     prepare_source_addresses,
+)
+from lmcache_ascend.v1.npu_connector.packed_main import (
+    PackedMainByteAdapter,
+    recognize_packed_main,
 )
 from lmcache_ascend.v1.npu_connector.utils import (
     batched_fused_single_layer_kv_transfer,
@@ -1770,6 +1774,7 @@ class _GroupLayout:
         "layer_token_bytes",
         "block_map_cpu",
         "block_map_device",
+        "packed_main",
     )
 
     def __init__(self) -> None:
@@ -1793,6 +1798,9 @@ class _GroupLayout:
         self.layer_token_bytes: tuple[int, ...] = ()
         self.block_map_cpu = None
         self.block_map_device = None
+        # Python-only packed main group: opaque 656-byte rows, never a
+        # KVCacheFormat value because the enum maps to the native ABI.
+        self.packed_main: Optional[PackedMainKVLayout] = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -1984,6 +1992,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             self._selected_prefill_closed_saves: set[int] = set()
         self.indexer_c8_layout = kwargs.pop("indexer_c8_layout", None)
         self.indexer_hbm_block_map = kwargs.pop("indexer_hbm_block_map", None)
+        # Explicit opt-in for the opaque packed main group. Only the exact
+        # PackedMainKVLayout.SCHEMA marker is accepted, and only for group 0.
+        self.packed_main_schema = kwargs.pop("packed_main_schema", None)
         mapping = self.indexer_hbm_block_map
         if mapping is not None and (
             self.indexer_c8_layout is None
@@ -6617,6 +6628,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layout = self._lazy_initialize_buffer_with_staging(
             self.kvcaches, kv_group=kv_group, init_staging=False
         )
+        if getattr(layout, "packed_main", None) is not None:
+            raise NotImplementedError(
+                "Packed main KV group store is not wired to the NPU connector "
+                "yet; use get_packed_main_adapter() for exact byte save/restore"
+            )
         if not self.supports_batched_from_gpu_group(kv_group):
             raise ValueError(
                 "Dense direct group store requires an MLA/DSA layout and an "
@@ -6836,6 +6852,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         layout = self._lazy_initialize_buffer_with_staging(
             caches, kv_group=group, init_staging=False
         )
+        if getattr(layout, "packed_main", None) is not None:
+            raise NotImplementedError(
+                "Packed main KV checkpoint capture is not wired to the NPU "
+                "connector yet; use get_packed_main_adapter() for exact byte "
+                "save/restore"
+            )
         if not self.supports_batched_from_gpu_group(group):
             raise ValueError(
                 "Checkpoint capture requires the dense MLA/DSA group kernel"
@@ -7058,6 +7080,15 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if kv_group is None:
             kv_group = self._current_kv_group
         return self._group_layouts.get(kv_group)
+
+    def get_packed_main_adapter(
+        self, kv_group: int = 0
+    ) -> Optional[PackedMainByteAdapter]:
+        """Return the exact-byte adapter for an initialized packed main group."""
+        layout = self._group_layouts.get(kv_group)
+        if layout is None or layout.packed_main is None:
+            return None
+        return PackedMainByteAdapter(layout.packed_main)
 
     def get_num_layers(self, kv_group: int = 0) -> Optional[int]:
         """Return the authoritative layer count of a KV group.
@@ -7372,6 +7403,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             max_staging_tokens=max_staging_tokens,
             indexer_c8_layout=getattr(metadata, "indexer_c8_layout", None),
             indexer_hbm_block_map=getattr(metadata, "indexer_hbm_block_map", None),
+            packed_main_schema=getattr(metadata, "packed_main_schema", None),
             worker_id=metadata.worker_id,
         )
 
@@ -7389,6 +7421,84 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         )
         self.gpu_buffer_allocator = layout.gpu_buffer_allocator
 
+    def _initialize_packed_main_buffer(
+        self,
+        kv_caches,
+        *,
+        kv_group: int,
+        init_staging: Optional[bool],
+    ) -> _GroupLayout:
+        """Build the opaque byte layout for explicitly selected packed main.
+
+        Packed main has no ``KVCacheFormat`` value because the enum maps to
+        the native ABI. Recognition therefore requires both ``kv_group == 0``
+        and the caller's explicit ``PackedMainKVLayout.SCHEMA`` marker; the
+        tensor shape alone never selects this path.
+        """
+        layout = self._group_layouts.get(kv_group)
+        if layout is None:
+            packed = recognize_packed_main(
+                kv_caches,
+                kv_group=kv_group,
+                schema=self.packed_main_schema,
+            )
+            layout = _GroupLayout()
+            layout.packed_main = packed
+            layout.kv_device = packed.device
+            layout.storage_dtype = torch.uint8
+            layout.num_layers = packed.layers
+            layout.layer_indices = tuple(range(packed.layers))
+            layout.layer_token_bytes = (
+                PackedMainKVLayout.ROW_BYTES,
+            ) * packed.layers
+            # Keep kv_format UNDEFINED: packed main must never reach a native
+            # kernel that switches on the enum. Consumers use packed_main.
+            payload = packed.payload_schema(self.lmcache_chunk_size)
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            layout.layout_signature = hashlib.blake2b(
+                encoded.encode(), digest_size=8
+            ).hexdigest()
+            self._group_layouts[kv_group] = layout
+            self._reset_sparse_direct_layer_states()
+            logger.info(
+                "LMCache NPU packed main layout: signature=%s kv_group=%d "
+                "schema=%s",
+                layout.layout_signature,
+                kv_group,
+                payload,
+            )
+        elif layout.packed_main is None:
+            raise ValueError(
+                "Packed main schema must be selected before kv_group layout "
+                "initialization"
+            )
+
+        self._current_kv_group = kv_group
+        self._mirror_layout(layout)
+
+        if init_staging is None:
+            init_staging = self.use_gpu
+        if init_staging and layout.gpu_buffer_allocator is None:
+            max_tokens = (
+                layout.packed_main.blocks * PackedMainKVLayout.PAGE_TOKENS
+            )
+            staging_tokens = self._layerwise_staging_num_tokens(max_tokens)
+            per_slot_bytes = staging_tokens * PackedMainKVLayout.ROW_BYTES
+            pool_slots = self._layerwise_staging_pool_slots()
+            layout.staging_bytes_per_slot = per_slot_bytes
+            logger.info(
+                "Lazily initializing packed main GPU buffer "
+                "(kv_group=%d): tokens=%d slots=%d bytes=%d",
+                kv_group,
+                staging_tokens,
+                pool_slots,
+                per_slot_bytes * pool_slots,
+            )
+            self._assign_group_gpu_allocator(
+                per_slot_bytes * pool_slots, layout
+            )
+        return layout
+
     def _lazy_initialize_buffer(
         self,
         kv_caches,
@@ -7403,6 +7513,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         and allocated independently on its first call instead of the first
         group pinning a single ``self.kv_format`` for both.
         """
+        if getattr(self, "packed_main_schema", None) is not None and kv_group == 0:
+            return self._initialize_packed_main_buffer(
+                kv_caches, kv_group=kv_group, init_staging=init_staging
+            )
+
         if init_staging is None:
             init_staging = self.use_gpu
 
@@ -7724,6 +7839,9 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if kv_group is None:
             kv_group = self._current_kv_group
         layout = self._group_layouts.get(kv_group)
+        packed_main = getattr(layout, "packed_main", None)
+        if packed_main is not None:
+            return packed_main.chunk_shape(num_tokens)
         fmt = layout.kv_format if layout is not None else self.kv_format
         k_hidden = layout.k_hidden_dims if layout is not None else self.k_hidden_dims
         v_hidden = layout.v_hidden_dims if layout is not None else self.v_hidden_dims
@@ -7788,6 +7906,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group=kv_group,
             init_staging=False,
         )
+        if getattr(layout, "packed_main", None) is not None:
+            raise NotImplementedError(
+                "Packed main KV load is not wired to the NPU connector yet; "
+                "use get_packed_main_adapter() for exact byte save/restore"
+            )
         is_mla_dsa = self._is_mla_dsa_format(kv_group)
         dense_direct = is_mla_dsa and not _DENSE_DIRECT_LOAD_DISABLE
         readiness_out = kwargs.get("_dense_load_readiness_out")
@@ -8559,6 +8682,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 kv_group=kv_group,
                 init_staging=False,
             )
+        if getattr(layout, "packed_main", None) is not None:
+            raise NotImplementedError(
+                "Packed main KV prepared sparse load is not wired to the NPU "
+                "connector yet; use get_packed_main_adapter() for exact byte "
+                "save/restore"
+            )
         if diagnostics is not None:
             diagnostics["layout_cache_hit"] = layout_cache_hit
             diagnostics["layout_resolve_ms"] = round(
@@ -8860,6 +8989,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group=kv_group,
             init_staging=False,
         )
+        if getattr(layout, "packed_main", None) is not None:
+            raise NotImplementedError(
+                "Packed main KV sparse load is not wired to the NPU connector "
+                "yet; use get_packed_main_adapter() for exact byte save/restore"
+            )
         if diagnostics is not None:
             diagnostics["layout_cache_hit"] = layout_cache_hit
             diagnostics["layout_resolve_ms"] = round(
@@ -9476,6 +9610,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             kv_group=kv_group,
             init_staging=False,
         )
+        if getattr(layout, "packed_main", None) is not None:
+            raise NotImplementedError(
+                "Packed main KV store is not wired to the NPU connector yet; "
+                "use get_packed_main_adapter() for exact byte save/restore"
+            )
         is_mla_dsa = self._is_mla_dsa_format(kv_group)
         dense_direct = is_mla_dsa and not _DENSE_DIRECT_STORE_DISABLE
 
